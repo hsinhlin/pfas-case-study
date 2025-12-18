@@ -1,0 +1,1142 @@
+---
+title: "PFAS Case Study"
+author: "Baloni Lab_Tiffany Lin"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float:
+      collapsed: true
+# output: 
+#     html_document: 
+#         css: style.css
+#         toc: true
+#         toc_float: true
+#         fig_caption: yes
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,   # don’t show code by default
+  message = FALSE,   # suppress package messages
+  warning = FALSE,   # suppress warnings
+  fig.align = "center"
+)
+```
+
+## Introduction
+
+This R Markdown analyzes bulk RNA-seq data from **mouse liver** (GEO: GSE212294).
+The dataset includes WT and PPARα-KO mice exposed to PFAS compounds (PFOA, GenX, and control) under a high-fat diet.
+We use the provided gene-level count matrix to perform DESeq2 normalization, differential expression, PCA, and downstream pathway enrichment, focusing on treatment- and genotype-specific transcriptional responses.
+
+> **Paper Reference:** Gabal, E., Azaizeh, M., & Baloni, P. (2025).
+> Investigating Lipid and Energy Dyshomeostasis Induced by Per- and Polyfluoroalkyl Substances (PFAS) Congeners in Mouse Model Using Systems Biology Approaches.
+> Metabolites, 15(8), 499.
+> <https://doi.org/10.3390/metabo15080499>
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(dbplyr)
+library(biomaRt)
+library(ggforce)
+library(ggraph)
+library(pheatmap)
+library(ggVennDiagram)
+library(VennDiagram)
+```
+
+## Load Data
+
+```{r load_data}
+# setwd("~/Library/CloudStorage/Box-Box/Tiffany/case_study/raw_data")
+data_dir <- "~/Library/CloudStorage/Box-Box/Tiffany/case_study/raw_data"
+cts_raw <- read.table(file.path(data_dir, "GSE212294_TxImport.GeneLevel.counts.GEO.txt"), 
+                      sep = "\t", 
+                      header = TRUE)
+cts_preprocessed <- read.csv(file.path(data_dir, 'liver_case_3_raw_preprocessed.csv'))
+sample_info <- read.csv(file.path(data_dir, 'meta_data_liver_case3.csv'))
+```
+
+## Use `biomaRt` to map transcript to gene
+
+The goal of this step is to convert Ensembl gene IDs into human-readable gene symbols and retrieve each gene’s biotype (e.g., protein-coding).
+
+```{r biomaRt}
+ensembl <- useEnsembl(
+  biomart = "ensembl",
+  dataset = "mmusculus_gene_ensembl"   # mouse dataset
+)
+
+gene_ids <- cts_raw$X
+
+gene_map <- getBM(
+    attributes = c("ensembl_gene_id", "external_gene_name", "gene_biotype"),
+    filters    = "ensembl_gene_id",      # WHAT YOU HAVE
+    values     = gene_ids,               # vector of Ensembl IDs
+    mart       = ensembl
+)
+
+# Merge gene symbols to dataset
+cts_mapped <- merge(
+    cts_raw,
+    gene_map,
+    by.x = "X",
+    by.y = "ensembl_gene_id",
+    all.x = TRUE
+)
+
+```
+
+## Aggregate transcript rows to gene level
+
+**Why aggregate?** Many genes have multiple transcript entries in the raw dataset.
+Differential expression and pathway analysis require one count per gene, not per transcript.
+
+This step combines multiple transcripts into one value per gene so each gene appears only once in the dataset.
+After filtering to protein-coding genes, all transcripts for the same gene are averaged to create a clean gene-level count matrix for downstream analysis.
+
+In this step, I included **all protein-coding genes** so that the downstream analyses capture the full transcriptional response, not only metabolism-related pathways.
+
+```{r aggregate}
+# aggregation(), to make sure that each gene has only one row, take the mean of all gene transcripts
+
+# check
+colnames(cts_raw)
+
+# Before aggregating, filter out only the protein-coding genes using biotype
+cts_pc <- subset(cts_mapped, gene_biotype == "protein_coding")
+
+# Choose which columns to aggregate (all PFASdil* columns)
+sample_cols <- grep("^PFASdil", names(cts_pc), value = TRUE)
+
+# Data frame with just sample columns + gene name
+df_for_agg <- cts_pc[, c(sample_cols, "external_gene_name")]
+
+# aggregation 
+cts_agg <- aggregate(.~external_gene_name,
+                     data = df_for_agg,
+                     FUN = mean)
+
+```
+
+## Create cts & coldata
+
+**Two genotypes:**
+
+-   WT
+-   PPARα Knockout (KO)
+
+**Four Treatments:** Each genotype was exposed to one of four PFAS treatment conditions
+
+-   CTRL
+-   GenX: Exposure to the short-chain PFAS replacement compound GenX at 0.30 mg/kg.
+-   PFOA low dose
+-   PFOA high dose
+
+| Group   | Genotype | Treatment                   |
+|---------|----------|-----------------------------|
+| Group 1 | WT       | Control                     |
+| Group 2 | KO       | Control                     |
+| Group 3 | WT       | GenX (0.30 mg/kg)           |
+| Group 4 | KO       | GenX (0.30 mg/kg)           |
+| Group 5 | WT       | PFOA low dose (0.05 mg/kg)  |
+| Group 6 | KO       | PFOA low dose               |
+| Group 7 | WT       | PFOA high dose (0.30 mg/kg) |
+| Group 8 | KO       | PFOA high dose              |
+
+```{r cts_coldata}
+# DESeq2 requires rownames(coldata) to match colnames(cts).
+
+# 1. Count Matrix
+cts_df <- as.data.frame(cts_agg)
+rownames(cts_agg) <- cts_agg$external_gene_name
+cts_agg <- cts_agg[,-1]
+cts_agg <- round(cts_agg) # dds requires integers
+cts <- as.data.frame(cts_agg)
+
+# 2. Sample Annotation
+coldata <- as.data.frame(sample_info)
+rownames(coldata) <- coldata$SampleID # MUST match colnames(cts)
+coldata <- coldata[,c('Genotype', 'Treatment', 'Groups')] # keep all rows and only two columns
+
+# clean up quotes in Treatment
+coldata$Treatment <- gsub('"', "", coldata$Treatment)
+
+# convert to factor 
+coldata$Genotype <- factor(coldata$Genotype, levels = c("WT", "PPARα_KO"))
+coldata$Treatment <- factor(coldata$Treatment, levels =  c("Ctrl", "GenX_0.30", "PFOA_0.05", "PFOA_0.30"))
+coldata$Groups <- factor(coldata$Groups, levels = paste0("Group ", 1:8))
+
+```
+
+#### Verify Sample Name Alignment Between coldata and cts
+
+```{r check}
+coldata <- coldata[colnames(cts), ] # coldata reorders to the exact same order
+all(rownames(coldata) == colnames(cts)) # should return TRUE
+coldata
+```
+
+## Build dds object
+
+```{r DESeqDataSet}
+library(DESeq2)
+
+# create dds object (combining both genotype and treatment)
+dds <- DESeqDataSetFromMatrix(
+    countData = cts,        # count matrix with round counts!
+    colData = coldata,      # metaData data frame
+    design = ~ Genotype + Treatment # do it seperate
+    )
+
+# dds for only genotype
+# the model test only KO vs CTRL without treatment 
+dds_gene <- DESeqDataSetFromMatrix(
+    countData = cts,
+    colData = coldata,
+    design = ~Genotype
+)
+
+```
+
+## Pre-filter
+
+```{r pre-filter}
+# keep only genes that have at least 10 counts in at least 3 samples
+smallestGroupSize <- 3
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep,]
+```
+
+```{r pre-filter_gene}
+keep_gene <- rowSums(counts(dds_gene) >= 10) >= 3
+dds_gene  <- dds_gene[keep_gene, ]
+```
+
+## DE Analysis
+
+```{r dds_DEAnalysis}
+# Relevel first, set WT as the reference
+dds$Genotype <- relevel(dds$Genotype, ref = "WT")
+# Treatment already has Ctrl as reference: levels = Ctrl, GenX_0.30, PFOA_0.05, PFOA_0.30
+
+dds <- DESeq(dds)
+
+# Look at available coefficients
+resultsNames(dds)
+
+# get specific sample comparisons
+
+# GenX 0.30 vs Ctrl
+res_GenX030_vs_Ctrl <- results(dds,
+                               contrast = c("Treatment", "GenX_0.30", "Ctrl"))
+
+# KO vs WT (log2FC = KO / WT)
+res_KO_vs_WT <- results(dds,
+                        contrast = c("Genotype", "PPARα_KO", "WT"))
+
+# PFOA high
+res_PFOA_0.30_vs_Ctrl <- results(dds,
+                               contrast = c("Treatment", "PFOA_0.30", "Ctrl"))
+
+# PFOA low
+res_PFOA_0.05_vs_Ctrl <- results(dds,
+                               contrast = c("Treatment", "PFOA_0.05", "Ctrl"))
+```
+
+#### DEAnalysis gor gene
+
+```{r dds_gene_DEAnalysis}
+# Relevel
+dds_gene$Genotype <- relevel(dds_gene$Genotype, ref = "WT")
+
+# Run DESeq
+dds_gene <- DESeq(dds_gene)
+
+resultsNames(dds_gene)
+# "Intercept" "Genotype_PPARα_KO_vs_WT"
+```
+
+```{r DEGs-genotype}
+# DESeq has already been run on dds_gene with design = ~ Genotype
+
+# KO vs WT (log2FC = KO / WT)
+res_gene <- results(dds_gene,
+                    contrast = c("Genotype", "PPARα_KO", "WT"))
+
+# ONLY to display padj-based DESeq2 summary
+summary(res_gene, alpha = 0.05)
+
+# === FILTERING CRITERIA ===
+p_cutoff   <- 0.05
+lfc_cutoff <- 1.2     # small effect size threshold
+
+# Create DEG Table
+deg_gene_tbl <- res_gene %>%
+    as.data.frame() %>%
+    rownames_to_column("Gene") %>%
+    filter(pvalue < p_cutoff & abs(log2FoldChange) > lfc_cutoff)
+
+# Extract gene list
+deg_gene_ids <- deg_gene_tbl$Gene
+length(deg_gene_ids)
+
+### up and down regulated genes after filtering ###
+up_genes <- deg_gene_tbl %>% filter(log2FoldChange > 1.2) %>% pull(Gene)
+down_genes <- deg_gene_tbl %>% filter(log2FoldChange < -1.2) %>% pull(Gene)
+
+length(up_genes)
+length(down_genes)
+```
+
+```{r write tables}
+# write tables
+# write.csv(up_genes, "~/Desktop/Baloni_Lab/DEG_list/up_PPAR_KO_vs_WT_genes.csv", row.names = FALSE)
+
+# write.csv(down_genes, "~/Desktop/Baloni_Lab/DEG_list/down_PPAR_KO_vs_WT_genes.csv", row.names = FALSE)
+
+```
+
+#### Normalized Counts (for Heatmap)
+
+```{r norm_counts}
+norm_counts <- counts(dds_gene, normalized = TRUE)
+
+norm_up   <- norm_counts[up_genes, ]
+norm_down <- norm_counts[down_genes, ]
+
+# Row-scale and cluster UP genes
+up_scaled <- t(scale(t(norm_up)))              # row-wise z-score
+up_dend   <- hclust(dist(up_scaled))           # cluster rows
+norm_up_ord <- norm_up[up_dend$order, ]        # reorder rows by cluster
+
+# Row-scale and cluster DOWN genes
+down_scaled <- t(scale(t(norm_down)))
+down_dend   <- hclust(dist(down_scaled))
+norm_down_ord <- norm_down[down_dend$order, ]
+
+# Combine: UP genes on top, DOWN genes at bottom
+norm_combined <- rbind(norm_up_ord, norm_down_ord)
+```
+
+### Variance Stabilizing Transformation (VST)
+
+```{r vst}
+vsd <- vst(dds, blind=FALSE)
+head(assay(vsd), 3)
+```
+
+## PCA plot
+
+```{r pca-basic-vst, include=FALSE}
+plotPCA(vsd, intgroup = c("Genotype", "Treatment"))
+```
+
+```{r pca-vst, fig.width=9}
+
+pcaData <- plotPCA(
+    vsd, 
+    intgroup = c("Genotype", "Treatment"), 
+    returnData = TRUE
+)
+
+# clean factor levels to ensure ordering and remove extra spaces
+# plotPCA inherit factor levels from dds, not coldata
+pcaData$Genotype <- factor(trimws(pcaData$Genotype), 
+                           levels = c("WT", "PPARα_KO"))
+pcaData$Treatment <- factor(pcaData$Treatment,
+                            levels = unique(pcaData$Treatment))
+
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+
+# Build plot
+pcaplot <- ggplot(pcaData, aes(PC1, PC2)) +
+    geom_point(size=3, aes(color = Treatment, shape = Genotype)) +
+    geom_mark_ellipse(aes(fill = Treatment), alpha = 0.05, show.legend = FALSE) +
+    xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+    ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+    coord_fixed() +
+    ggtitle("PCA of PFAS Samples (VST-transformed counts)") +
+    scale_color_manual(
+    values = c(
+    "Ctrl"       = "green4",
+    "PFOA_0.05"  = "deeppink1",
+    "PFOA_0.30"  = "deeppink4",
+    "GenX_0.30"  = "navy")
+  ) +
+  scale_fill_manual(
+    values = c(
+    "Ctrl"       = "green4",
+    "PFOA_0.05"  = "deeppink1",
+    "PFOA_0.30"  = "deeppink4",
+    "GenX_0.30"  = "navy")) +
+  scale_shape_manual(
+    values = c("WT" = 17, "PPARα_KO" = 16)  # Triangle for WT, Circle for KO
+  ) +
+  theme_classic() +
+  theme(
+    axis.title.y = element_text(size = 15, color = "black", margin = margin(r = 15)),
+    axis.title.x = element_text(size = 15, color = "black", margin = margin(t = 15)),
+    axis.text.x = element_text(size = 12, margin = margin(t = 6)),
+    axis.text.y = element_text(size = 12, margin = margin(r = 6)),
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    legend.spacing.x = unit(1, 'cm'),
+    line = element_line(linewidth = 1)
+  )
+
+
+pcaplot
+```
+
+::: callout-tip
+**Figure 1. PCA of VST-transformed protein-coding genes from PFAS-treated mouse livers.**\
+Samples show partial separation by genotype along PC1 (49% variance), with PPARα_KO mice clustering predominantly on the left and WT mice on the right.
+This shows that the samples are seperated based on genotype.
+However, **the separation is not absolute**.
+PC2 (17% variance) shows dose-dependent PFAS responses (treatment), with high-dose PFOA_0.30 samples shifting downward regardless of genotype.
+:::
+
+## Heatmap (normalized vs scaled gene count for DEGs in PPARα−/− (KO) vs. wild-type mice.
+
+-   Normalized counts make all samples comparable by adjusting for sequencing depth.
+-   Scaled counts (Z-scores) show whether a gene is expressed higher or lower relative to itself across samples.
+
+For normalized heatmap, we only need normalized count and annotation data.
+
+```{r anno}
+# 1) Prepare Annotation data from existing coldata
+anno <- coldata[, c("Genotype"), drop = FALSE]
+
+# 2) Reorder annotation rows to match columns of norm_combined
+anno <- anno[colnames(norm_combined), , drop = FALSE]
+
+# 3) Order samples: WT first, then PPARα_KO
+sample_order <- order(anno$Genotype)        # uses factor levels WT, PPARα_KO
+norm_combined <- norm_combined[, sample_order]
+anno_ord     <- anno[sample_order, , drop = FALSE]
+
+# number of WT samples, to draw a vertical gap between WT and KO
+# geno_ord <- coldata[colnames(norm_deg_ord), "Genotype"]
+n_WT <- sum(anno_ord$Genotype == "WT")
+# n_KO <- sum(geno_ord == "PPARα_KO")
+```
+
+```{r heatmap, fig.height=9, fig.width=8, fig.cap="**Figure 2:** Heatmap of normalized gene counts in PPARα knock out and wild type genotype group."}
+# 4) Plot heatmap of genotype DEGs
+library (pheatmap)
+
+anno_colors <- list(
+  Genotype = c("WT" = "forestgreen", "PPARα_KO" = "turquoise3")
+)
+
+
+
+pheatmap(norm_combined,
+         scale           = "row",           # per-gene z-score
+         cluster_rows    = FALSE,           # cluster genes
+         cluster_cols    = FALSE,           # keep WT block then KO block
+         show_rownames   = FALSE,
+         annotation_col  = anno_ord,
+         annotation_colors = anno_colors,
+         gaps_col        = n_WT,            # vertical line between WT and KO
+         color           = colorRampPalette(c("blue", "white", "red3"))(50),
+         border_color    = NA,
+         angle_col       = 90,
+         fontsize_col    = 10,
+         main            = "Genotype DEGs: PPARα_KO vs WT")
+```
+
+::: callout-tip
+**Figure 2. Differentially expressed genes between PPARα-KO and WT mouse livers (DESeq2 normalized counts).** Heatmap shows DESeq2 size-factor–normalized gene expression values for all DEGs identified between WT and PPARα-KO mice.
+Each row represents a gene, and each column represents one liver sample.
+Expression values were row-scaled to highlight relative up- and down-regulation patterns.
+**(202 upregulated, 257 downregulated; p \< 0.05, \|log2FC\| \> 1.2)**.
+WT and KO samples form two clear groups, indicating that loss of PPARα produces strong and consistent transcriptional changes.
+:::
+
+Row-wise Z-score scaling was applied to emphasize relative expression patterns across samples.Z-scoring standardizes each gene to mean 0 and SD 1 so that all genes contribute equally to the heatmap and clustering.
+
+Use 1.2 cutoff for a better separation between KO and WT.
+
+## Enrichment Analysis {.tabset}
+
+### EnrichKG
+
+To **identify the biological pathways associated with the differentially expressed genes (DEGs)**, we performed pathway enrichment using Enrichr-KG, an online knowledge-graph–based enrichment tool.
+The lists of upregulated and downregulated genes from the PPARα-KO vs WT comparison were uploaded to Enrichr-KG, and the resulting ranked pathway tables were exported.
+
+The code below reads in the enrichment results and visualizes the top 20 enriched pathways for upregulated genes.
+Pathways are plotted by their statistical significance using –log10(p-value), with a red vertical line indicating the conventional **significance cutoff (p = 0.05)**.
+Each bar represents one enriched pathway, and labels are printed directly for readability.
+
+This plot highlights which biological processes are most strongly associated with genes upregulated in PPARα knockout mice.
+
+Use [Enrichr KG](https://maayanlab.cloud/enrichr-kg).
+
+```{r read_enrich}
+up_path <- read.csv('/Users/rusher/Desktop/Baloni_Lab/DEG_list/genotype_DEG_heatmap/up_PPARaKO_vs_WT10.csv')
+
+down_path <- read.csv('/Users/rusher/Desktop/Baloni_Lab/DEG_list/genotype_DEG_heatmap/down_PPARa_vs_WT10.csv')
+```
+
+```{r up-enrich, fig.cap= "**Figure 3.** Top 20 enriched biological pathways associated with genes upregulated in PPARα-knockout (PPARα-KO) mouse livers. Bars represent pathway significance measured by –log10(p-value), with the red vertical line marking the p = 0.05 threshold." }
+colnames(up_path)
+
+# Take first 10 pathways (Enrichr returns sorted tables)
+up_top20 <- up_path[1:20, ]
+
+up_plot <- ggplot(up_top20,
+                  aes(x = -log10(p.value),
+                      y = reorder(Term, -p.value))) +
+    geom_col(fill = "gold") +
+    geom_text(aes(label = Term, x = 0.2),
+            hjust = 0,
+            color = "black",
+            size = 3) +
+    geom_vline(xintercept = -log10(0.05), 
+             linetype = "solid", 
+             color = "red", 
+             linewidth = 0.8) +
+    theme_minimal() +
+    theme(
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 16, face = "bold"),
+        axis.text.x  = element_text(size = 14, face = "bold")
+    ) +
+    labs(x = "-log10(p-value)",
+    title = "Up-regulated genes in PPARα Knock Out")
+
+up_plot
+```
+
+::: callout-tip
+**Figure 3.** The pathways enriched in PPARα-KO mice mostly involve **stress, inflammation, and cell damage responses, rather than metabolism**.
+Many of the highlighted terms relate to immune activity, cell death, or tissue repair, suggesting that **without PPARα, the liver activates protective pathways to cope with stress**.
+Some pathways also reflect changes in tissue structure.
+Overall, these results show that PPARα-KO mice respond to PFAS exposure by **turning on general stress-response pathways**, instead of the metabolic pathways normally controlled by PPARα.
+:::
+
+```{r down-enrich, fig.cap= "**Figure 4.** Top 20 downregulated biological pathways associated with genes in PPARα-knockout (PPARα-KO) mouse livers. Bars represent pathway significance measured by –log10(p-value), with the red vertical line marking the p = 0.05 threshold."}
+colnames(down_path)
+
+# Take first 10 pathways (Enrichr returns sorted tables)
+down_top20 <- down_path[1:20, ]
+
+down_plot <- ggplot(down_top20,
+                  aes(x = -log10(p.value),
+                      y = reorder(Term, -p.value))) +
+    geom_col(fill = "skyblue") +
+    geom_text(aes(label = Term, x = 0.2),
+            hjust = 0,
+            color = "black",
+            size = 3) +
+    geom_vline(xintercept = -log10(0.05), 
+             linetype = "solid", 
+             color = "red", 
+             linewidth = 0.8) +
+    theme_minimal() +
+    theme(
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(size = 16, face = "bold"),
+        axis.text.x  = element_text(size = 14, face = "bold")
+    ) +
+    labs(x = "-log10(p-value)",
+    title = "Down-regulated genes in PPARα Knock Out")
+
+down_plot
+```
+
+::: callout-tip
+**Figure 4.** The pathways most strongly downregulated in PPARα-KO mice are almost entirely related to **lipid metabolism**, including fatty acid β-oxidation, long-chain fatty acid transport, peroxisomal lipid processing, and the PPAR signaling pathway itself.
+
+These results are expected because PPARα is a key transcription factor that activates genes required for breaking down fatty acids.
+When PPARα is removed, these fat-burning programs are sharply reduced, indicating impaired peroxisomal and mitochondrial lipid oxidation.
+Overall, the figure highlights the central role of PPARα in maintaining normal liver energy and lipid metabolism.
+:::
+
+## Enrichr
+![downregulated_path_genes_KOvsWT][/Users/rusher/Desktop/Baloni_Lab/DEG_list/genotype_DEG_heatmap/down_WTvs_KO_KEGG_2021_Human_bar_graph.png]
+
+
+## Heatmap for Treatment group (1-8)
+
+### Create dds_group
+
+```{r dds_group}
+# dds for only Treatment groups
+dds_group <- DESeqDataSetFromMatrix(
+    countData = cts,
+    colData = coldata,
+    design = ~ Groups
+)
+```
+
+### DEAnalysis for Treatment Groups
+
+```{r dds_group_prefilter}
+# keep genes with at least 10 count in ≥ 3 samples
+keep <- rowSums(counts(dds_group) >= 10) >= 3
+dds_group <- dds_group[keep,]
+```
+
+**Group 1 condition: WT + Ctrl -\> set as reference group.**
+
+```{r dds_group_DESeq}
+# Set reference
+coldata$Groups <- factor(coldata$Groups,
+                         levels = paste("Group", 1:8))
+dds_group$Groups <- relevel(dds_group$Groups, ref = "Group 1")
+
+# Run DESeq
+dds_group <- DESeq(dds_group)
+resultsNames(dds_group)
+```
+
+### Extract DEGs for Group 2-8
+
+```{r extract_group_deg}
+p_cutoff <- 0.05
+lfc_cutoff <- 0.5
+
+groups <- 2:8
+group_DEGs <- list()
+
+for (g in groups){
+    # 1. build DESeq results name
+    comp <- paste0("Groups_Group.", g, "_vs_Group.1")
+    
+    # 2. get DESEq results for comparison
+    res <- results(dds_group, name = comp)
+    
+    # 3. convert to dataframe and add Gene column
+    df <- as.data.frame(res)
+    df$Gene <- rownames(df)
+    
+    # 4. filter DEGs
+    df <- df[df$pvalue < p_cutoff & abs(df$log2FoldChange) > lfc_cutoff, ]
+    
+    # 5. tag up and down regulation
+    df$Expression <- ifelse(df$log2FoldChange > 0, "Upregulated", "Downregulated")
+    
+    # 6. Store in the list with name
+    group_name <- paste0("Group", g)
+    group_DEGs[[group_name]] <- df
+    
+    # Move Gene column to the first position
+    df <- df[, c("Gene", setdiff(colnames(df), "Gene"))]
+    
+    # 7. Save csv file
+    out_dir <- "/Users/rusher/Desktop/Baloni_Lab/DEG_list/group_DEG_heatmap/"
+    out_file <- file.path(out_dir, paste0(group_name, "_vs_Group1_DEGs.csv"))
+    write.csv(df, out_file, row.names = FALSE)
+}
+
+# check
+sapply(group_DEGs, nrow)
+```
+
+### Normalization of the full dds_group
+
+To ensure that all treatment groups are comparable, **normalization was performed once across the entire dataset** using the DESeq2 size-factor method.
+Instead of normalizing each group separately, the full dds_group object—containing all samples and treatment conditions—was used to compute a single set of normalization factors.
+This global normalization preserves biological differences between groups while correcting for sequencing depth and library size variation.
+
+```{r dds_group_norm}
+norm_group_counts <- counts(dds_group, normalized = TRUE)
+
+# Collect all group DEGs
+all_deg_genes <- unique(unlist(lapply(group_DEGs, function(df) df$Gene)))
+
+# Subset normalized matrix
+heat_mat <- norm_group_counts[all_deg_genes, ]
+heat_mat <- as.matrix(heat_mat)
+
+# order sample by groups
+sample_order <- order(coldata$Groups)
+heat_mat_ord <- heat_mat[, sample_order]
+```
+
+### Heatmap
+
+```{r group_heatmap_anno}
+### Annotation for Heatmap
+# Use the same coldata used in DESeq2, but keep only Groups column
+anno_group <- coldata[, c("Groups"), drop = FALSE]
+
+# Reorder annotation to match reordered heatmap matrix
+anno_group_ord <- anno_group[sample_order, , drop = FALSE]
+
+# Group Color
+group_colors <- c(
+  "Group 1" = "lightblue",   
+  "Group 2" = "purple",   
+  "Group 3" = "pink",  
+  "Group 4" = "lightgreen",  
+  "Group 5" = "orange", 
+  "Group 6" = "blue",   
+  "Group 7" = "lavender",   
+  "Group 8" = "coral"    
+)
+anno_colors <- list(Groups = group_colors)
+top_labels <- as.character(anno_group$Groups)
+```
+
+```{r group_heatmap, fig.height = 7, fig.width = 6, fig.cap= "**Figure 5.** Heatmap of DEGs across PFAS treatment groups 1-8.  "}
+library(pheatmap)
+pheatmap(
+    heat_mat_ord,
+    scale = "row",                     
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,              # groups already ordered
+    show_rownames = FALSE,
+    annotation_col = anno_group_ord,
+    annotation_colors = anno_colors,
+    gaps_col = cumsum(table(anno_group_ord$Groups)),
+    color = colorRampPalette(c("blue", "white", "red3"))(50),
+    fontsize_col = 10,
+    border_color = black,
+    legend = TRUE,
+    main = "Treatment Group DEGs (Groups 1–8)"
+)
+```
+
+::: callout-tip
+**Figure 5** shows all genes that were significantly differentially expressed in at least one treatment group (Groups 2–8) **relative to Group 1 (p \< 0.05, \|log2FC\| \> 0.5)**.
+Each column is a liver sample ordered by treatment group, and each row is one DEG.
+The values are DESeq2 size-factor–normalized counts, transformed with row-wise Z-scores, so red indicates higher-than-average expression for that gene and blue indicates lower-than-average expression.
+
+Differences in patterns between blocks reflect group-specific and dose/genotype-dependent PFAS responses, with some groups (e.g. 7,8) showing stronger gene-expression changes than others.
+:::
+
+## Venn Diagram
+
+```{r venn_group}
+# build up and down gene list for group 2-8
+group_name <- paste0("Group", 2:8)
+
+# Upregulated Genes per group (loop through group 2-8)
+up_lists <- lapply(group_name, function(g){
+    df <- group_DEGs[[g]]
+    df$Gene[df$Expression == "Upregulated"]
+})
+names(up_lists) <- paste("Group", 2:8)
+
+# Downregulated genes per group 
+down_lists <- lapply(group_name, function(g) {
+  df <- group_DEGs[[g]]
+  df$Gene[df$Expression == "Downregulated"]
+})
+names(down_lists) <- paste("Group", 2:8)
+```
+
+### Save up and down gene list
+
+```{r save_up, include=FALSE}
+## Directory for saving files
+#outdir_up <- "/Users/rusher/Desktop/Baloni_Lab/DEG_list/up"
+#
+## Loop over each group in up_lists
+#for (g in names(up_lists)) {
+#  
+#  gene_vec <- up_lists[[g]]        # extract gene list
+#  outfile  <- file.path(outdir_up, paste0(g, "_up_genes.txt"))
+#  
+#  write.table(
+#    gene_vec,
+#    file = outfile,
+#    quote = FALSE,
+#    row.names = FALSE,
+#    col.names = FALSE
+#  )
+#  
+#  message("Saved: ", outfile)
+#}
+```
+
+```{r save_down, include=FALSE}
+## Directory for saving files
+#outdir_down <- "/Users/rusher/Desktop/Baloni_Lab/DEG_list/down/"
+#
+## Loop over each group
+#for (g in names(down_lists)) {
+#  
+#  gene_vec <- down_lists[[g]]
+#  outfile  <- file.path(outdir_down, paste0(g, "_down_genes.txt"))
+#  
+#  write.table(
+#    gene_vec,
+#    file = outfile,
+#    quote = FALSE,
+#    row.names = FALSE,
+#    col.names = FALSE
+#  )
+#  
+#  message("Saved: ", outfile)
+#}
+```
+
+```{r venn-down, fig.width=7, fig.height=6}
+library(ggplot2)
+library(ggVennDiagram)
+
+# Downregulated Genes
+plot_venn_down <- ggVennDiagram(
+    down_lists,
+    category.names = names(down_lists),
+    label_alpha = 0,
+    label = "count"
+) +
+    scale_fill_gradient(low = "white", high = "skyblue") + 
+    theme_void() +
+    labs(title = "Downregulated Genes", )+
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18) )
+plot_venn_down
+```
+
+::: callout-tip
+**Figure 6. Downregulated DEGs across PFAS treatment groups (Groups 2–8).** High-dose PFOA exposure produced the strongest repression signatures, with **382 downregulated genes in WT (Group 7) and 294 in PPARα⁻/⁻ mice (Group 8)**, indicating substantial transcriptional suppression at higher doses.
+In contrast, GenX-exposed groups (Groups 3–4) and low-dose PFOA groups (Groups 5–6) showed more modest down regulation profiles, with fewer uniquely repressed genes.
+Only two genes were down regulated across all treatment groups, suggesting that PFAS-induced transcriptional repression is **condition specific**, influenced by both dose and PPARα genotype.
+:::
+
+```{r venn-up, fig.width=7, fig.height=6}
+# Upregulated Genes
+plot_venn_up <- ggVennDiagram(
+    up_lists,
+    category.names = names(up_lists),
+    label_alpha = 0,
+    label = "count"
+) +
+    scale_fill_gradient(low = "white", high = "coral") + 
+    theme_void() +
+    labs(title = "Upregulated Genes", )+
+    theme(
+      legend.position = "right",
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 18) )
+plot_venn_up
+```
+
+::: callout-tip
+**Figure 7. Upregulated DEGs across PFAS treatment groups (Groups 2–8).** Similar to the downregulated gene patterns, high-dose PFOA produced the most transcriptional activation, with **482 upregulated genes in WT mice (Group 7) and 302 in PPARα⁻/⁻ mice (Group 8).** Low-dose PFOA (Groups 5–6) and GenX exposure (Groups 3–4) show more moderate activation profiles.
+Only 10 genes were consistently upregulated across all eight treatment groups, indicating that PFAS-induced activation is largely group (condition) specific.
+:::
+
+## Bubble plot - Enriched pathways across treatment groups
+
+```{r}
+library(stringr)
+
+up_dir   <- "~/Desktop/Baloni_Lab/DEG_list/group_enrich/up_enrich/"
+down_dir <- "~/Desktop/Baloni_Lab/DEG_list/group_enrich/down_enrich/"
+
+# helper function to read file
+read_enrich_file <- function(file, group_name) {
+  df <- read.csv(file)
+
+  df %>% 
+    dplyr::select(Term, p.value, overlaps) %>% 
+    dplyr::mutate(
+      Group = group_name,
+      GeneCount = str_count(overlaps, ";") + 1,
+      log_pval = -log10(p.value)
+    )
+  # add three new columns
+}
+```
+
+```{r read_up_enrich}
+library(dplyr)
+groups <- 3:8
+group_names <- paste0("Group ", groups)
+
+up_files <- paste0(up_dir, "G", groups, "_up_enrich.csv")
+
+up_all <- bind_rows(
+  mapply(read_enrich_file, file = up_files, group_name = group_names, SIMPLIFY = FALSE)
+)
+```
+
+```{r up_bubble_plot, fig.width=9, fig.height=10}
+up_plot <- ggplot(up_all, aes(x = Group, y = Term)) +
+  geom_point(aes(size = GeneCount, fill = log_pval),
+             shape = 21) +
+  scale_fill_gradientn(colors = c("pink2", "purple", "red"),
+                       name = "-log10(p-value)") +
+  scale_size(range = c(1, 4), name = "Gene Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        plot.title = element_text(size = 18, face = "bold", hjust = 0.5)) +
+  labs(title = "Upregulated Enrichment Pathway", x = NULL, y = NULL)
+
+up_plot
+```
+
+::: callout-tip
+**Figure 8.** Upregulated enriched pathways across PFAS treatment groups (Groups 3–8) relative to Group 1.
+Bubble size represents the number of DEGs mapped to each pathway, while color indicates pathway significance (–log₁₀ p-value).
+Although many pathway terms appear distinct, they cluster into a few major biological themes:
+
+-   fatty acid metabolism and β-oxidation
+-   lipid homeostasis and PPAR signaling
+-   xenobiotic detoxification and oxidative-stress pathways
+-   inflammatory and stress-response signaling
+-   structural and connective-tissue–related phenotype annotations
+-   broader energy-metabolism pathways
+
+Together, these patterns indicate that PFAS exposure—particularly high-dose PFOA—activates strong metabolic remodeling, enhances fatty acid oxidation, and induces detoxification and inflammatory responses in mouse liver.
+:::
+
+```{r read_down_enrich}
+library(dplyr)
+
+down_files <- paste0(down_dir, "G", groups, "_down_enrich.csv")
+
+down_all <- bind_rows(
+  mapply(read_enrich_file, file = down_files, group_name = group_names, SIMPLIFY = FALSE)
+)
+```
+
+```{r down_bubble_plot, fig.width=9, fig.height=10}
+
+down_plot <- ggplot(down_all, aes(x = Group, y = Term)) +
+  geom_point(aes(size = GeneCount, fill = log_pval),
+             shape = 21, color = "black") +
+  scale_fill_gradientn(
+    colors = c("grey", "blue", "navy"),
+    name = "-log10(p-value)"
+  ) +
+  scale_size(range = c(1,4), name = "Gene Count") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    title = "Downregulated Enrichment Pathway",
+    x = NULL,
+    y = NULL
+  )
+
+down_plot
+```
+
+::: callout-tip
+**Figure 9.** Downregulated pathways across PFAS treatment groups (Groups 3–8).
+Bubble plot shows pathways significantly downregulated relative to Group 1 (WT-Control).
+Many suppressed pathways fall into **fatty-acid oxidation, lipid catabolism, and peroxisomal metabolism, consistent with impaired PPARα-regulated lipid breakdown.** Immune-related pathways—including interferon responses and complement activation—are also reduced, indicating potential PFAS-associated immunosuppression.
+High-dose PFOA (Groups 7–8) displays the largest number of strongly downregulated pathways, highlighting dose-dependent metabolic and immune disruption.
+Bubble size reflects the number of DEGs involved; color indicates pathway significance (–log10 p-value).
+:::
+
+> PFAS exposure disrupts normal liver metabolism, especially lipid pathways.
+> - High-dose PFOA and PPARα-KO mice show the strongest changes.
+> - Upregulated pathways = stress and detox responses.
+> - Downregulated pathways = impaired fatty-acid breakdown and weakened immune signaling.
+> Overall, PFAS pushes the liver into a stressed, dysregulated state with poor metabolic function.
+
+## Pathway Network Analysis
+
+For the pathway network analysis, we combined results from Enrichr-KG with the **DESeq2 KO vs WT differential expression output**.
+From Enrichr-KG, we extracted the top five enriched pathways for both upregulated and downregulated DEGs and expanded their overlap gene lists to identify which genes belong to each pathway.
+These pathway–gene pairs were then merged with the DESeq2 DEG table to assign each gene its regulation status (up- or downregulated).
+This allowed us to build a network graph in which pathways connect to the DEGs that drive their enrichment, providing a clear visual map of how PPARα-dependent transcriptional changes cluster within key biological pathways.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr) 
+
+# choose top 5 pathways
+up_top5   <- up_path[1:5, ]
+down_top5 <- down_path[1:5, ]
+
+# ---- Up pathways: Pathway–Gene edges ----
+up_edges <- up_top5 %>%
+  dplyr::select(Term, overlaps) %>%
+  tidyr::separate_rows(overlaps, sep = ";") %>%
+  dplyr::mutate(overlaps = stringr::str_trim(overlaps)) %>%
+  dplyr::rename(Pathway = Term, Gene = overlaps) %>%
+  dplyr::mutate(PathStatus = "Up_pathway")
+
+# ---- Down pathways: Pathway–Gene edges ----
+down_edges <- down_top5 %>%
+  dplyr::select(Term, overlaps) %>%
+  tidyr::separate_rows(overlaps, sep = ";") %>%
+  dplyr::mutate(overlaps = stringr::str_trim(overlaps)) %>%
+  dplyr::rename(Pathway = Term, Gene = overlaps) %>%
+  dplyr::mutate(PathStatus = "Down_pathway")
+
+path_gene_edges_top5 <- dplyr::bind_rows(up_edges, down_edges)
+
+head(path_gene_edges_top5) 
+
+```
+
+### Add DEG direction (Up/down) to table `path_gene_edges_top5`
+
+```{r add_DEG_dir}
+# 1. Add Direction if you haven't already
+deg_gene_tbl <- deg_gene_tbl %>%
+  dplyr::mutate(
+    Direction  = ifelse(log2FoldChange > 0, "Upregulated", "Downregulated"),
+  )
+
+# 2. Uppercase the genes from Enrichr edges
+#path_gene_edges_top5 <- path_gene_edges_top5 %>%
+#  dplyr::mutate(Gene_upper = toupper(Gene))
+
+# 3. Join using the uppercased gene name
+net_df_top5 <- path_gene_edges_top5 %>%
+  dplyr::inner_join(
+    deg_gene_tbl %>% dplyr::select(Gene, Direction),
+    by = "Gene"
+  )
+
+head(net_df_top5)
+nrow(net_df_top5)
+ 
+```
+
+### Build graph objects
+
+```{r build_graph_top5}
+library(tidygraph)
+library(ggraph)
+
+# Edges: Pathway → Gene
+edges_top5 <- net_df_top5 %>%
+  dplyr::distinct(Pathway, Gene) %>%
+  dplyr::rename(from = Pathway, to = Gene)
+
+# Nodes: pathways + genes with attributes
+nodes_top5 <- tibble::tibble(
+  name = unique(c(edges_top5$from, edges_top5$to))
+) %>%
+  dplyr::mutate(
+    type = ifelse(name %in% edges_top5$from, "Pathway", "Gene")
+  ) %>%
+  # add pathway status
+  dplyr::left_join(
+    net_df_top5 %>%
+      dplyr::distinct(Pathway, PathStatus) %>%
+      dplyr::rename(name = Pathway),
+    by = "name"
+  ) %>%
+  # add gene direction
+  dplyr::left_join(
+    net_df_top5 %>%
+      dplyr::distinct(Gene, Direction) %>%
+      dplyr::rename(name = Gene),
+    by = "name"
+  )
+
+nodes_top5 <- nodes_top5 %>%
+  dplyr::mutate(
+    ColorClass = dplyr::case_when(
+      type == "Pathway" & PathStatus == "Up_pathway"   ~ "Up Pathway",
+      type == "Pathway" & PathStatus == "Down_pathway" ~ "Down Pathway",
+      type == "Gene"    & Direction == "Upregulated"   ~ "Up Gene",
+      type == "Gene"    & Direction == "Downregulated" ~ "Down Gene"
+    )
+  )
+
+nodes_top5 <- nodes_top5 %>%
+  dplyr::mutate(
+    label = dplyr::if_else(
+      type == "Gene",
+      paste0(toupper(substr(name, 1, 1)),
+             tolower(substr(name, 2, nchar(name)))),
+      name
+    )
+  )
+g_top5 <- tbl_graph(nodes = nodes_top5, edges = edges_top5, directed = FALSE)
+```
+
+### Plot pathway-gene network
+
+```{r plot_pathway_network_top5, fig.width=9, fig.height=7}
+
+
+ggraph(g_top5, layout = "fr") +
+  geom_edge_link(alpha = 0.25, colour = "grey70") +
+
+  # Use the clean ColorClass column for colors
+  geom_node_point(
+    aes(
+      size  = ifelse(type == "Pathway", 6, 2),
+      color = ColorClass
+    )
+  ) +
+
+  geom_node_text(
+    aes(label = name),
+    repel = TRUE,
+    size = 3
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Up Pathway"   = "gold",
+      "Down Pathway" = "steelblue",
+      "Up Gene"      = "firebrick",
+      "Down Gene"    = "darkturquoise"
+    ),
+    name = "Node Type"       # Legend title
+  ) +
+
+  scale_size_identity(guide = "none") +   # no size legend
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text  = element_text(size = 10)
+  ) +
+
+  ggtitle("PPARα-KO vs WT: Top 5 Enriched Pathways and DEGs")
+```
+
+:::{.callout-tip}
+**Figure 10.** Central metabolic pathways such as fatty acid β-oxidation, PPAR signaling, and lipid metabolism cluster with key genes including **ACOX1, ACOT2, HADHB, PPARA, and PLIN2**. These genes play core roles in breaking down fatty acids and regulating energy balance: ACOX1 catalyzes the first step of peroxisomal β-oxidation, ACOT2 controls fatty-acyl CoA availability, HADHB participates in mitochondrial β-oxidation, PPARA is the transcription factor that activates these metabolic programs, and PLIN2 regulates lipid droplet storage. Their coordinated changes in PPARα-KO livers shows a widespread disruption of lipid-catabolic capacity and energy homeostasis.
+:::
+
+## Preliminary Results Summary {.tabset}
+
+### Highlights
+
+- PFAS exposure induces strong, dose-dependent transcriptional changes in mouse liver, with high-dose PFOA producing the most pronounced effects.
+- Loss of PPARα leads to widespread downregulation of fatty acid β-oxidation and lipid catabolic pathways, consistent with impaired hepatic energy metabolism.
+- Upregulated genes in PPARα-KO livers are enriched for stress, inflammatory, and tissue-remodeling pathways, indicating a compensatory response to metabolic dysfunction (compensatory response).
+- PPARα-dependent metabolic programs are attenuated in knockout mice, demonstrating that PFAS-driven lipid metabolism responses require functional PPARα signaling.
+- Pathway network analysis reveals coordinated regulation of key lipid-metabolism genes (e.g., Acox1, Acot2, Hadhb, Plin2) within enriched pathways, highlighting systems-level disruption of liver metabolism.
+- Treatment-group analyses shows distinct genotype- and dose-specific transcriptional signatures, with high-dose PFOA affecting both metabolic and immune pathways.
+
+### Results
+Using bulk RNA-seq data from PFAS-treated mouse livers (GSE212294), we first compared PPARα-KO vs WT across all conditions and identified 459 differentially expressed genes (202 up, 257 down; p < 0.05, |log₂FC| > 1.2). Heatmap and PCA analyses showed clear separation, indicating strong seperation between genotype and treatment group transcriptional data. Enrichr-KG pathway enrichment revealed that **upregulated genes in PPARα-KO livers were mainly associated with stress, inflammatory, and tissue-damage pathways**, whereas **downregulated genes were enriched for lipid metabolism**, including fatty-acid β-oxidation, peroxisomal lipid processing, and PPAR signaling. Group-wise differential expression across the eight treatment groups (WT/KO × Ctrl/GenX/PFOA low/PFOA high) showed that high-dose PFOA in both WT and KO mice produced the largest number of DEGs and the strongest pathway shifts, while GenX and low-dose PFOA caused more moderate responses. Bubble plots and pathway–gene network analysis highlighted coordinated regulation of key lipid metabolic genes (e.g., ACOX1, ACOT2, HADHB, PPARA, PLIN2) across fatty-acid oxidation, lipid catabolism, and detoxification pathways, alongside suppression of several immune and signaling pathways.
+
+### Conclusions
+Overall, this analysis supports a model in which PFAS exposure, especially high-dose PFOA (Group7 and 8), disrupts normal hepatic lipid metabolism and stress responses in a PPARα-dependent manner. Loss of PPARα **downregulates fatty-acid catabolic pathways** and **shifts the liver toward stress, inflammatory, and structural remodeling pathways** *(Kersten et al., 2017; Montagner et al., 2016; Stec et al., 2019)*. At the same time, treatment-group analyses reveal dose- and genotype-dependent transcriptional signatures, with **high-dose PFOA showing the strongest impact on both metabolic and immune pathways.** These results provide a gene- and pathway-level framework that complements the original study and can be further integrated with genome-scale metabolic models to predict PFAS-induced changes in liver energy metabolism.
+
+## Reference Papers
+
+Gabal, E., Azaizeh, M., & Baloni, P. (2025). Investigating Lipid and Energy Dyshomeostasis Induced by Per- and Polyfluoroalkyl Substances (PFAS) Congeners in Mouse Model Using Systems Biology Approaches. Metabolites, 15(8), 499. https://doi.org/10.3390/metabo15080499
+
+Kersten, S., & Stienstra, R. (2017). The role and regulation of the peroxisome proliferator activated receptor alpha in human liver. Biochimie, 136, 75–84. https://doi.org/10.1016/j.biochi.2016.12.019
+
+Montagner A, Polizzi A, Fouché E, et alLiver PPARα is crucial for whole-body fatty acid homeostasis and is protective against NAFLDGut 2016;65:1202-1214.
+
